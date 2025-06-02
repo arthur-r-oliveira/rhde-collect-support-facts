@@ -1,10 +1,12 @@
 ---
 - name: Collect MicroShift SOS Reports and oc adm inspect output
-  hosts: your_microshift_host_group # Define this group in your inventory
+  hosts: local-lab # Define this group in your inventory
   become: yes                      # Execute commands with sudo/root privileges
   vars:
     report_base_dir: "/tmp/microshift_reports" # Temporary directory on MicroShift host for reports
     local_collection_dir: "./collected_microshift_reports" # Directory on Ansible control node
+    # NEW: Variable to set the KUBECONFIG path on the MicroShift host
+    microshift_kubeconfig_path: "/var/lib/microshift/resources/kubeconfig" # Default for MicroShift, adjust if different
 
   tasks:
     - name: Create local collection directory if it doesn't exist
@@ -31,7 +33,7 @@
         mode: '0755'
 
     - name: Collect microshift-sos-report
-      ansible.builtin.command: microshift-sos report -o {{ host_report_dir }}
+      ansible.builtin.command: microshift-sos-report --tmp-dir {{ host_report_dir }}
       args:
         creates: "{{ host_report_dir }}/sosreport-microshift-*.tar.xz" # Prevents re-running if report exists
       register: sos_report_output
@@ -41,7 +43,10 @@
         - sos_report
 
     - name: Get list of all application namespaces
+      # Use `kubeconfig` variable with `environment`
       ansible.builtin.command: oc get namespaces -o jsonpath='{.items[?(@.metadata.labels.kubernetes\.io/metadata\.name!="kube-system" && @.metadata.labels.kubernetes\.io/metadata\.name!="openshift" && @.metadata.labels.kubernetes\.io/metadata\.name!="default" && @.metadata.labels.kubernetes\.io/metadata\.name!="kube-public" && @.metadata.labels.kubernetes\.io/metadata\.name!="kube-node-lease")].metadata.name}'
+      environment:
+        KUBECONFIG: "{{ microshift_kubeconfig_path }}"
       register: app_namespaces_raw
       changed_when: false
       tags:
@@ -54,7 +59,10 @@
         - oc_inspect
 
     - name: Run oc adm inspect for each application namespace
+      # Use `kubeconfig` variable with `environment`
       ansible.builtin.command: oc adm inspect ns/{{ item }} --dest-dir={{ host_report_dir }}
+      environment:
+        KUBECONFIG: "{{ microshift_kubeconfig_path }}"
       loop: "{{ app_namespaces }}"
       loop_control:
         label: "oc adm inspect for namespace: {{ item }}"
