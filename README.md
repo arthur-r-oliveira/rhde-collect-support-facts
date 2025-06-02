@@ -1,0 +1,1 @@
+# rhde-collect-support-facts

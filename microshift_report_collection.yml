@@ -1,0 +1,111 @@
+---
+- name: Collect MicroShift SOS Reports and oc adm inspect output
+  hosts: your_microshift_host_group # Define this group in your inventory
+  become: yes                      # Execute commands with sudo/root privileges
+  vars:
+    report_base_dir: "/tmp/microshift_reports" # Temporary directory on MicroShift host for reports
+    local_collection_dir: "./collected_microshift_reports" # Directory on Ansible control node
+
+  tasks:
+    - name: Create local collection directory if it doesn't exist
+      ansible.builtin.file:
+        path: "{{ local_collection_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true # Only run this task once on the control node
+
+    - name: Get current timestamp for unique report directory
+      ansible.builtin.command: date +%Y%m%d%H%M%S
+      register: current_timestamp
+      changed_when: false
+
+    - name: Set full report directory path on MicroShift host
+      ansible.builtin.set_fact:
+        host_report_dir: "{{ report_base_dir }}/{{ inventory_hostname }}-{{ current_timestamp.stdout }}"
+
+    - name: Create temporary report directory on MicroShift host
+      ansible.builtin.file:
+        path: "{{ host_report_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Collect microshift-sos-report
+      ansible.builtin.command: microshift-sos report -o {{ host_report_dir }}
+      args:
+        creates: "{{ host_report_dir }}/sosreport-microshift-*.tar.xz" # Prevents re-running if report exists
+      register: sos_report_output
+      failed_when: sos_report_output.rc != 0 and "No command 'microshift-sos' found" not in sos_report_output.stderr
+      ignore_errors: true # Continue even if sos report fails for some reason
+      tags:
+        - sos_report
+
+    - name: Get list of all application namespaces
+      ansible.builtin.command: oc get namespaces -o jsonpath='{.items[?(@.metadata.labels.kubernetes\.io/metadata\.name!="kube-system" && @.metadata.labels.kubernetes\.io/metadata\.name!="openshift" && @.metadata.labels.kubernetes\.io/metadata\.name!="default" && @.metadata.labels.kubernetes\.io/metadata\.name!="kube-public" && @.metadata.labels.kubernetes\.io/metadata\.name!="kube-node-lease")].metadata.name}'
+      register: app_namespaces_raw
+      changed_when: false
+      tags:
+        - oc_inspect
+
+    - name: Split namespaces string into a list
+      ansible.builtin.set_fact:
+        app_namespaces: "{{ app_namespaces_raw.stdout.split(' ') | unique }}"
+      tags:
+        - oc_inspect
+
+    - name: Run oc adm inspect for each application namespace
+      ansible.builtin.command: oc adm inspect ns/{{ item }} --dest-dir={{ host_report_dir }}
+      loop: "{{ app_namespaces }}"
+      loop_control:
+        label: "oc adm inspect for namespace: {{ item }}"
+      register: oc_inspect_output
+      ignore_errors: true # Continue even if inspect fails for a specific namespace
+      tags:
+        - oc_inspect
+
+    - name: Find the generated sos report archive
+      ansible.builtin.find:
+        paths: "{{ host_report_dir }}"
+        patterns: "sosreport-microshift-*.tar.xz"
+        recurse: no
+      register: found_sos_archives
+      tags:
+        - sos_report
+
+    - name: Compress all collected oc adm inspect directories into a single tar.gz
+      ansible.builtin.archive:
+        path: "{{ host_report_dir }}/*"
+        dest: "{{ host_report_dir }}/oc_adm_inspect_reports_{{ current_timestamp.stdout }}.tar.gz"
+        format: gz
+        remove: no # Keep original directories for now, can change to yes later
+      register: compress_oc_reports
+      tags:
+        - oc_inspect
+
+    - name: Fetch collected reports from MicroShift host to Ansible control node
+      ansible.builtin.fetch:
+        src: "{{ item.path }}"
+        dest: "{{ local_collection_dir }}/{{ inventory_hostname }}/"
+        flat: no # Create a directory per host within the local_collection_dir
+      loop: "{{ found_sos_archives.files }}"
+      loop_control:
+        label: "Fetching SOS report: {{ item.path }}"
+      when: found_sos_archives.files is defined and found_sos_archives.files | length > 0
+      tags:
+        - fetch_reports
+
+    - name: Fetch the compressed oc adm inspect reports
+      ansible.builtin.fetch:
+        src: "{{ compress_oc_reports.dest }}"
+        dest: "{{ local_collection_dir }}/{{ inventory_hostname }}/"
+        flat: no
+      when: compress_oc_reports.changed
+      tags:
+        - fetch_reports
+
+    - name: Clean up temporary report directory on MicroShift host
+      ansible.builtin.file:
+        path: "{{ host_report_dir }}"
+        state: absent
+      tags:
+        - cleanup
